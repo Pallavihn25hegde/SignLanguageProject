@@ -1,0 +1,7 @@
+asl_env/
+archive/
+__pycache__/
+*.pyc
+.vscode/
+*.p
+*.pickel
