@@ -7,7 +7,7 @@ A computer vision and machine learning application that detects American Sign La
 - Gesture classification using **Scikit-Learn (Random Forest)**
 - Text-to-speech feedback via **pyttsx3**
 - Real-time video stream processing with **OpenCV**
-
+![ASL Recognition Demo](demo.png)
 ## Project Setup
 
 1. **Clone the repository:**
