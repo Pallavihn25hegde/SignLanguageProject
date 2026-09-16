@@ -1,7 +1,18 @@
+# Virtual environments
 asl_env/
-archive/
-__pycache__/
-*.pyc
-.vscode/
+.asl_env/
+venv/
+env/
+
+# Model binaries & data
 *.p
-*.pickel
+*.pkl
+*.pickle
+*.h5
+*.pickle
+dataset/
+ASL Alphabet/
+archive/
+
+# Nested duplicate repository folder
+SignLanguageProject/

@@ -14,3 +14,4 @@ A computer vision and machine learning application that detects American Sign La
    ```bash
    git clone [https://github.com/Pallavihn25hegde/SignLanguageProject.git](https://github.com/Pallavihn25hegde/SignLanguageProject.git)
    cd SignLanguageProject
+   ![ASL Recognition Demo](demo.png)
