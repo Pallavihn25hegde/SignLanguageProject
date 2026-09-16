@@ -1,272 +1,220 @@
 import os
+import pickle
 import sys
-import time
-from collections import deque
+import threading
+import tkinter as tk
+from tkinter import messagebox
 import cv2
-import joblib
 import mediapipe as mp
 import numpy as np
+import pyttsx3
+
+# Suppress TensorFlow/protobuf warning logs
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# --- 1. MEDIAPIPE SETUP ---
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7,
+    max_num_hands=1,
+)
+
+# --- 2. LOAD MODEL ---
+model = None
+MODEL_PATH = './model.p'
+
+if os.path.exists(MODEL_PATH):
+  with open(MODEL_PATH, 'rb') as f:
+    model_dict = pickle.load(f)
+    model = model_dict['model']
+else:
+  print(f"WARNING: '{MODEL_PATH}' not found. Please run train_model.py first.")
 
 
-def load_model_artifacts():
-    """Locates and loads unified model and encoder files from models/ or root."""
-    search_dirs = [os.path.join(os.path.dirname(__file__), "models"), os.path.dirname(__file__), "."]
+# --- 3. LIGHTING ENHANCEMENT FUNCTION ---
+def enhance_lighting(image):
+  """Applies CLAHE on the L-channel in LAB color space to balance shadows and highlights."""
+  lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+  l_channel, a_channel, b_channel = cv2.split(lab)
 
-    model_path = None
-    encoder_path = None
+  # CLAHE equalizes local contrast without blowing out bright spots
+  clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+  cl = clahe.apply(l_channel)
 
-    for directory in search_dirs:
-        m_candidate = os.path.join(directory, "unified_models.pkl")
-        e_candidate = os.path.join(directory, "unified_encoders.pkl")
-
-        if os.path.exists(m_candidate) and not model_path:
-            model_path = m_candidate
-        if os.path.exists(e_candidate) and not encoder_path:
-            encoder_path = e_candidate
-
-    if not model_path or not encoder_path:
-        print("❌ Error: Model or encoder files not found.")
-        print("Expected 'unified_models.pkl' and 'unified_encoders.pkl' in root or 'models/' directory.")
-        print("\nPlease train models first:")
-        print("  python train_model.py")
-        sys.exit(1)
-
-    print(f"📂 Loading models from: {model_path}")
-    models = joblib.load(model_path)
-    encoders = joblib.load(encoder_path)
-
-    print("✅ Models loaded:")
-    print(f"   Letter model: {'✓' if 'letter' in models else '✗'}")
-    print(f"   Phrase model: {'✓' if 'phrase' in models else '✗'}")
-
-    return models, encoders
+  enhanced_lab = cv2.merge((cl, a_channel, b_channel))
+  return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
 
 
-def extract_landmarks(results):
-    """Extracts up to 2 hands (126 features) and normalizes shape."""
-    landmarks = []
+# --- 4. SPEECH HELPER ---
+def speak_async(text):
+  """Speaks text in a background thread to prevent GUI/camera lag."""
+
+  def _speak():
+    if text.strip():
+      try:
+        engine = pyttsx3.init()
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
+      except Exception:
+        pass
+
+  threading.Thread(target=_speak, daemon=True).start()
+
+
+# --- 5. WEBCAM LOOP ---
+current_sentence = ''
+
+
+def start_webcam():
+  global current_sentence, model
+
+  # Reload model in case it was updated while the GUI stayed open
+  if os.path.exists(MODEL_PATH):
+    with open(MODEL_PATH, 'rb') as f:
+      model = pickle.load(f)['model']
+
+  if model is None:
+    messagebox.showerror(
+        'Model Error',
+        'model.p not found! Please run train_model.py before starting the'
+        ' camera.',
+    )
+    return
+
+  cap = cv2.VideoCapture(0)
+  if not cap.isOpened():
+    messagebox.showerror('Camera Error', 'Could not access webcam (index 0).')
+    return
+
+  while True:
+    ret, frame = cap.read()
+    if not ret:
+      break
+
+    frame = cv2.flip(frame, 1)
+    H, W, _ = frame.shape
+
+    # Apply lighting balance
+    processed_frame = enhance_lighting(frame)
+    frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(frame_rgb)
+
+    current_prediction = ''
+
     if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            for lm in hand_landmarks.landmark:
-                landmarks.extend([lm.x, lm.y, lm.z])
+      hand_landmarks = results.multi_hand_landmarks[0]
+      mp_drawing.draw_landmarks(
+          frame, hand_landmarks, mp_hands.HAND_CONNECTIONS
+      )
 
-    # Pad to fixed 126 features (21 landmarks * 3 coordinates * 2 hands)
-    while len(landmarks) < 126:
-        landmarks.append(0.0)
+      # Wrist-anchored & scale-invariant normalization
+      base_x = hand_landmarks.landmark[0].x
+      base_y = hand_landmarks.landmark[0].y
 
-    return landmarks[:126]
+      coords = []
+      for lm in hand_landmarks.landmark:
+        coords.extend([lm.x - base_x, lm.y - base_y])
 
+      max_span = max(map(abs, coords)) or 1.0
+      normalized_coords = [val / max_span for val in coords]
 
-def main():
-    print("=" * 60)
-    print("  REAL-TIME ASL SIGN LANGUAGE TRANSLATOR")
-    print("=" * 60)
+      if len(normalized_coords) == 42:
+        try:
+          probabilities = model.predict_proba([np.asarray(normalized_coords)])[
+              0
+          ]
+          max_idx = np.argmax(probabilities)
+          confidence = probabilities[max_idx]
 
-    models, encoders = load_model_artifacts()
+          if confidence >= 0.65:
+            pred_raw = str(model.classes_[max_idx]).split('-')[0]
+            current_prediction = pred_raw
+            text_color = (0, 255, 0)
+          else:
+            current_prediction = '?'
+            text_color = (0, 165, 255)
+        except Exception:
+          pred = model.predict([np.asarray(normalized_coords)])
+          current_prediction = str(pred[0]).split('-')[0]
+          text_color = (0, 255, 0)
 
-    # Initialize MediaPipe
-    print("\n🖐️ Initializing MediaPipe...")
-    try:
-        mp_hands = mp.solutions.hands
-        hands = mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+        # Display letter only (no percentage)
+        cv2.putText(
+            frame,
+            f'{current_prediction}',
+            (50, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            2.2,
+            text_color,
+            3,
         )
-        mp_drawing = mp.solutions.drawing_utils
-        print("✅ MediaPipe ready")
-    except Exception as e:
-        print(f"❌ MediaPipe initialization error: {e}")
-        sys.exit(1)
 
-    # Initialize Camera
-    print("\n📷 Opening camera...")
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("❌ Cannot open webcam. Check connection or app permissions.")
-        sys.exit(1)
-    print("✅ Camera ready")
+    # Bottom banner for sentence output
+    cv2.rectangle(frame, (0, H - 55), (W, H), (25, 25, 25), -1)
+    cv2.putText(
+        frame,
+        f'Sentence: {current_sentence}',
+        (15, H - 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2,
+    )
 
-    # State variables
-    mode = "auto"  # 'auto', 'letter', or 'phrase'
-    phrase_buffer = deque(maxlen=30)
-    frame_count = 0
+    cv2.imshow('ASL Translator', frame)
 
-    print("\n" + "=" * 60)
-    print("🎮 CONTROLS:")
-    print("   'l' - LETTER mode (single letters)")
-    print("   'p' - PHRASE mode (continuous signs)")
-    print("   'a' - AUTO mode (detects both)")
-    print("   'q' - QUIT")
-    print("=" * 60)
-    print("\n✅ Ready! Start signing...\n")
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord(' '):  # SPACE: Append recognized letter
+      if current_prediction and current_prediction != '?':
+        current_sentence += current_prediction
+        speak_async(current_prediction)
+    elif key == ord('v'):  # V: Speak entire sentence
+      speak_async(current_sentence)
+    elif key == ord('c'):  # C: Clear sentence
+      current_sentence = ''
+    elif key == ord('q'):  # Q: Quit camera window
+      break
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Warning: Failed to capture frame from webcam")
-                continue
-
-            frame = cv2.flip(frame, 1)
-            display = frame.copy()
-            frame_count += 1
-
-            # Landmark extraction
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
-
-            # Draw hand skeleton overlay
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(
-                        display,
-                        hand_landmarks,
-                        mp_hands.HAND_CONNECTIONS,
-                        mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2),
-                        mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2),
-                    )
-
-            landmarks = extract_landmarks(results)
-            has_hand = np.sum(np.abs(landmarks)) > 0.1
-
-            # ---------------- MODE LOGIC ----------------
-            if mode == "letter" and "letter" in models:
-                if has_hand:
-                    features = np.array(landmarks).reshape(1, -1)
-                    try:
-                        pred = models["letter"].predict(features)[0]
-                        letter = encoders["letter"].inverse_transform([pred])[0]
-                        confidence = max(models["letter"].predict_proba(features)[0])
-
-                        if confidence > 0.5:
-                            cv2.rectangle(display, (50, 100), (350, 180), (0, 0, 0), -1)
-                            cv2.rectangle(display, (50, 100), (350, 180), (0, 255, 0), 2)
-                            cv2.putText(display, f"LETTER: {letter}", (60, 150),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-                            cv2.putText(display, f"Confidence: {confidence:.1%}", (60, 175),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                    except Exception:
-                        pass
-
-            elif mode == "phrase" and "phrase" in models:
-                if has_hand:
-                    phrase_buffer.append(landmarks)
-                    progress = len(phrase_buffer) / 30
-                    cv2.rectangle(display, (10, 30), (10 + int(progress * 300), 50), (0, 255, 0), -1)
-                    cv2.putText(display, f"Recording: {len(phrase_buffer)}/30", (10, 70),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-                    if len(phrase_buffer) == 30:
-                        try:
-                            flat_sequence = np.array(phrase_buffer).flatten().reshape(1, -1)
-                            pred = models["phrase"].predict(flat_sequence)[0]
-                            phrase = encoders["phrase"].inverse_transform([pred])[0]
-                            confidence = max(models["phrase"].predict_proba(flat_sequence)[0])
-
-                            if confidence > 0.5:
-                                cv2.rectangle(display, (50, 100), (450, 180), (0, 0, 0), -1)
-                                cv2.rectangle(display, (50, 100), (450, 180), (0, 255, 255), 2)
-                                cv2.putText(display, f"PHRASE: {phrase.upper()}", (60, 145),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-                                cv2.putText(display, f"Confidence: {confidence:.1%}", (60, 170),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                        except Exception:
-                            pass
-                        phrase_buffer.clear()
-                else:
-                    if len(phrase_buffer) > 0:
-                        phrase_buffer.clear()
-
-            else:  # 'auto' mode
-                if has_hand:
-                    phrase_buffer.append(landmarks)
-                    progress = len(phrase_buffer) / 30
-                    cv2.rectangle(display, (10, 30), (10 + int(progress * 300), 50), (0, 255, 0), -1)
-
-                    if len(phrase_buffer) == 30 and "phrase" in models:
-                        try:
-                            flat_sequence = np.array(phrase_buffer).flatten().reshape(1, -1)
-                            pred = models["phrase"].predict(flat_sequence)[0]
-                            phrase = encoders["phrase"].inverse_transform([pred])[0]
-                            confidence = max(models["phrase"].predict_proba(flat_sequence)[0])
-
-                            if confidence > 0.5:
-                                cv2.rectangle(display, (50, 100), (450, 180), (0, 0, 0), -1)
-                                cv2.rectangle(display, (50, 100), (450, 180), (0, 255, 255), 2)
-                                cv2.putText(display, f"PHRASE: {phrase.upper()}", (60, 145),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-                                cv2.putText(display, f"Confidence: {confidence:.1%}", (60, 170),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                        except Exception:
-                            pass
-                        phrase_buffer.clear()
-
-                    # Check single letters for quick gestures
-                    if len(phrase_buffer) < 10 and "letter" in models:
-                        try:
-                            features = np.array(landmarks).reshape(1, -1)
-                            pred = models["letter"].predict(features)[0]
-                            letter = encoders["letter"].inverse_transform([pred])[0]
-                            confidence = max(models["letter"].predict_proba(features)[0])
-
-                            if confidence > 0.7:
-                                cv2.rectangle(display, (50, 100), (350, 180), (0, 0, 0), -1)
-                                cv2.rectangle(display, (50, 100), (350, 180), (0, 255, 0), 2)
-                                cv2.putText(display, f"LETTER: {letter}", (60, 150),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-                                cv2.putText(display, f"Confidence: {confidence:.1%}", (60, 175),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                        except Exception:
-                            pass
-                else:
-                    if len(phrase_buffer) > 0:
-                        phrase_buffer.clear()
-
-            # Mode HUD
-            mode_colors = {"auto": (0, 255, 0), "letter": (255, 255, 0), "phrase": (0, 255, 255)}
-            cv2.putText(display, f"MODE: {mode.upper()}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_colors.get(mode, (255, 255, 255)), 2)
-
-            # Hand presence indicator
-            cv2.circle(display, (display.shape[1] - 30, 40), 10,
-                       (0, 255, 0) if has_hand else (0, 0, 255), -1)
-
-            # Controls HUD
-            cv2.putText(display, "l:Letter | p:Phrase | a:Auto | q:Quit",
-                        (10, display.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-            cv2.imshow("Unified Sign Language Recognition", display)
-
-            # Key handler
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                print("\n👋 Quitting...")
-                break
-            elif key == ord("l"):
-                mode = "letter"
-                phrase_buffer.clear()
-                print("\n📝 Switched to LETTER mode")
-            elif key == ord("p"):
-                mode = "phrase"
-                phrase_buffer.clear()
-                print("\n🎬 Switched to PHRASE mode")
-            elif key == ord("a"):
-                mode = "auto"
-                phrase_buffer.clear()
-                print("\n🔄 Switched to AUTO mode")
-
-    except KeyboardInterrupt:
-        print("\n👋 Session interrupted by user")
-    except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        hands.close()
-        print("✅ Cleanup complete.")
+  cap.release()
+  cv2.destroyAllWindows()
 
 
-if __name__ == "__main__":
-    main()
+# --- 6. GUI WINDOW ---
+root = tk.Tk()
+root.title('Sign Language Recognition')
+root.geometry('420x360')
+root.resizable(False, False)
+
+tk.Label(
+    root, text='SIGN TO SPEECH', font=('Helvetica', 18, 'bold'), fg='#111'
+).pack(pady=20)
+
+tk.Button(
+    root,
+    text='START CAMERA',
+    command=start_webcam,
+    bg='#2e7d32',
+    fg='white',
+    font=('Helvetica', 12, 'bold'),
+    padx=25,
+    pady=12,
+    relief='flat',
+).pack(pady=25)
+
+tk.Label(
+    root,
+    text=(
+        'Controls:\n[Space] Add Letter | [V] Speak Sentence\n[C] Clear | [Q]'
+        ' Exit Camera'
+    ),
+    font=('Helvetica', 9),
+    fg='#555',
+    justify='center',
+).pack(pady=10)
+
+if __name__ == '__main__':
+  root.mainloop()
